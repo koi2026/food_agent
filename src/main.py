@@ -7,6 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -38,13 +39,12 @@ COMPLETED_JSON_DIR = "completed/json"
 def load_source_md(path: str = SOURCE_MD_PATH) -> str:
     if not os.path.exists(path):
         return ""
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read().strip()
     # 재료 섹션이 비어있으면 source 없음으로 처리
     parsed = parse_source_md_to_data(path)
     if not parsed.get("ingredients"):
         return ""
-    return text
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
 
 
 def load_feedback_md(path: str = FEEDBACK_MD_PATH) -> str:
@@ -377,21 +377,6 @@ def generate_recipe(vision_result, servings, extra_requests):
         return None, raw_text
 
 
-def save_recipe(recipe: dict) -> str:
-    """레시피를 recipes/ 폴더에 JSON 파일로 저장한다. 저장된 경로를 반환한다."""
-    from datetime import datetime
-
-    os.makedirs("recipes", exist_ok=True)
-    dish_name = str(recipe.get("dish_name") or "recipe")
-    # 파일명 불가 문자 제거
-    safe_name = re.sub(r'[\\/:*?"<>|]', "", dish_name).strip() or "recipe"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"recipes/{timestamp}_{safe_name}.json"
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(recipe, f, ensure_ascii=False, indent=2)
-    return filename
-
-
 def extract_and_save_feedback(extra_requests: str):
     """extra_requests에서 장기 취향을 LLM으로 추출해 feedback.md에 타임스탬프와 함께 append."""
     from datetime import date
@@ -477,7 +462,6 @@ def get_shopping_items(ingredient: str) -> list:
 
 def build_naver_shopping_url(ingredient: str) -> str:
     """네이버 쇼핑 검색 URL (API 키 없을 때 fallback)."""
-    from urllib.parse import quote
     return f"https://search.shopping.naver.com/search/all?query={quote(ingredient.strip())}"
 
 
@@ -535,7 +519,7 @@ def build_shopping_html(missing_ingredients: list) -> str:
 # ─────────────────────────── source.md 파싱/저장 ───────────────────────────
 
 _AMOUNT_PATTERN_STR = re.compile(
-    r"^(\d+(?:\.\d+)?)(g|kg|ml|L|개|알|큰술|작은술|컵|줄기|묶음|장|쪽|톨|팩|봉|캔)$"
+    r"^(\d+(?:[./]\d+)?)(g|kg|ml|L|개|알|큰술|작은술|컵|줄기|묶음|장|쪽|톨|팩|봉|캔)$"
 )
 # 기준 단위로 변환: {"원래단위": ("기준단위", 배수)}
 _UNIT_CONVERSIONS: dict = {"kg": ("g", 1000), "L": ("ml", 1000)}
@@ -557,8 +541,13 @@ def _parse_amount_val(amount: str):
     m = _AMOUNT_PATTERN_STR.match(amount)
     if not m:
         return None
-    q = float(m.group(1))
+    qty_str = m.group(1)
     unit = m.group(2)
+    if '/' in qty_str:
+        _parts = qty_str.split('/')
+        q = float(_parts[0]) / float(_parts[1])
+    else:
+        q = float(qty_str)
     if unit in _UNIT_CONVERSIONS:
         base_unit, factor = _UNIT_CONVERSIONS[unit]
         q = q * factor
@@ -936,6 +925,10 @@ SESSION_DEFAULTS = {
     "recipe_confirmed": False,
     "awaiting_revision": False,
     "reanalyze_pending": False,
+    "_pending_analyze": False,
+    "_last_file_name": None,
+    "_typing": False,
+    "_pending_recipe": False,
     "viewing_recipe": None,
     # 장바구니 완료 처리 (채팅 내 — 하위 호환)
     "cart_selected_path": None,
@@ -952,9 +945,12 @@ SESSION_DEFAULTS = {
     "home_layout": "grid",
     "kitchen_complete_target": None,
     "kitchen_complete_result": None,
+    "kitchen_complete_dialog_open": False,
     "kitchen_source_edit_mode": False,
     "kitchen_source_edit_data": None,
     "kitchen_complete_success_msg": None,
+    "_recipe_loading": False,
+    "_recipe_loading_data": None,
 }
 
 
@@ -1043,6 +1039,7 @@ def reset_all():
         "_pending_analyze": False,
         "_pending_recipe": False,
         "_last_file_name": None,
+        "_typing": False,
         "viewing_recipe": None,
         "cart_selected_path": None,
         "cart_completion_result": None,
@@ -1056,9 +1053,12 @@ def reset_all():
         "home_layout": "grid",
         "kitchen_complete_target": None,
         "kitchen_complete_result": None,
+        "kitchen_complete_dialog_open": False,
         "kitchen_source_edit_mode": False,
         "kitchen_source_edit_data": None,
         "kitchen_complete_success_msg": None,
+        "_recipe_loading": False,
+        "_recipe_loading_data": None,
     }.items():
         st.session_state[key] = [] if isinstance(default, list) else default
 
@@ -1344,6 +1344,12 @@ def render_sidebar():
                     if _is_cart:
                         st.session_state["cart_selected_path"] = _item["path"]
                     st.rerun()
+
+            if len(_all_items) > 10:
+                st.markdown(
+                    f'<div style="font-size:11.5px;color:var(--ink-3);padding:4px 10px 8px">+{len(_all_items)-10}개 더 있어요 · 내 주방에서 확인</div>',
+                    unsafe_allow_html=True,
+                )
 
         # ── 사이드바 하단 프로필 ──
         st.markdown(
@@ -1723,7 +1729,7 @@ def _show_completion_dialog() -> None:
                 f'<div class="complete-line">'
                 f'<span class="cl-ic" style="background:var(--amber-soft);color:var(--amber-ink)">구매</span>'
                 f'<span class="nm">{_n}</span>'
-                f'{f"<span class=chr>{_a}</span>" if _a else ""}'
+                f'{f"<span class=\"chr\">{_a}</span>" if _a else ""}'
                 f'</div>'
             )
         st.markdown(_missing_html, unsafe_allow_html=True)
@@ -1758,12 +1764,18 @@ def render_kitchen_view():
     if _success_msg:
         st.success(_success_msg)
 
-    # 완료 처리 dialog 열기
-    if st.session_state.get("kitchen_complete_target") and st.session_state.get("kitchen_complete_result"):
+    # 완료 처리 dialog 열기 — one-shot 플래그로 다른 버튼 클릭 시 재오픈 방지
+    if st.session_state.get("kitchen_complete_dialog_open"):
+        st.session_state["kitchen_complete_dialog_open"] = False
         _show_completion_dialog()
 
     # topbar
-    _updated = date.today().isoformat()
+    import datetime as _dt
+    _src_path = SOURCE_MD_PATH
+    if os.path.exists(_src_path):
+        _updated = _dt.datetime.fromtimestamp(os.path.getmtime(_src_path)).strftime("%Y-%m-%d")
+    else:
+        _updated = date.today().isoformat()
     st.markdown(
         f"""
     <div class="topbar">
@@ -1838,6 +1850,7 @@ def render_kitchen_view():
                 st.session_state["kitchen_complete_result"] = _res
                 st.session_state["kitchen_source_edit_data"] = _sd
                 st.session_state["kitchen_source_edit_mode"] = False
+                st.session_state["kitchen_complete_dialog_open"] = True
                 st.rerun()
 
     # ── 보유 재료 패널 (Bug #26 수정) ──
@@ -1899,7 +1912,6 @@ def render_kitchen_view():
     # 숨겨진 재료 삭제 트리거 버튼들
     for i in range(len(_ings)):
         if st.button("_", key=f"del_ing_{i}", use_container_width=True):
-            print(st.session_state["kitchen_ingredients"])
             st.session_state["kitchen_ingredients"].pop(i)
             _save_kitchen_to_source()
             st.rerun()
@@ -1977,11 +1989,12 @@ def render_kitchen_view():
 (function() {
   var doc = window.parent.document;
 
-  // 재료/취향 삭제: event delegation — rerun마다 리스너 교체로 stale body 참조 방지
+  // 모든 kitchen 클릭을 event delegation으로 처리 — rerun 후 timing 문제 방지
   if (doc.__kitchenDelListener) {
     doc.body.removeEventListener('click', doc.__kitchenDelListener);
   }
   doc.__kitchenDelListener = function(e) {
+    // 재료 삭제
     var delBtn = e.target.closest('[data-del]');
     if (delBtn) {
       e.stopPropagation();
@@ -1990,39 +2003,35 @@ def render_kitchen_view():
       if (hidden) hidden.click();
       return;
     }
+    // 취향 삭제
     var delPrefBtn = e.target.closest('[data-del-pref]');
     if (delPrefBtn) {
       e.stopPropagation();
       var i = delPrefBtn.getAttribute('data-del-pref');
       var hidden = doc.querySelector('.st-key-del_pref_' + i + ' button');
       if (hidden) hidden.click();
+      return;
+    }
+    // 완료 처리 버튼
+    var completeBtn = e.target.closest('[data-complete]');
+    if (completeBtn) {
+      e.stopPropagation();
+      var key = completeBtn.getAttribute('data-complete');
+      var hidden = doc.querySelector('.st-key-kitchen_complete_' + key + ' button');
+      if (hidden) hidden.click();
+      return;
+    }
+    // 레시피 행 클릭 (레시피 보기) — complete 버튼 클릭은 제외
+    var viewRow = e.target.closest('[data-view]');
+    if (viewRow) {
+      var key = viewRow.getAttribute('data-view');
+      var hidden = doc.querySelector('.st-key-view_recipe_' + key + ' button');
+      if (hidden) hidden.click();
     }
   };
   doc.body.addEventListener('click', doc.__kitchenDelListener);
 
   function attach() {
-    // 완료 처리 대기 행 클릭 (레시피 보기)
-    doc.querySelectorAll('[data-view]').forEach(function(row) {
-      if (row.dataset.bound) return;
-      row.dataset.bound = '1';
-      row.addEventListener('click', function(e) {
-        if (e.target.closest('[data-complete]')) return;
-        var key = row.getAttribute('data-view');
-        var hidden = doc.querySelector('.st-key-view_recipe_' + key + ' button');
-        if (hidden) hidden.click();
-      });
-    });
-    // 완료 처리 버튼 클릭
-    doc.querySelectorAll('[data-complete]').forEach(function(btn) {
-      if (btn.dataset.bound) return;
-      btn.dataset.bound = '1';
-      btn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        var key = btn.getAttribute('data-complete');
-        var hidden = doc.querySelector('.st-key-kitchen_complete_' + key + ' button');
-        if (hidden) hidden.click();
-      });
-    });
     // body class 마커 (kitchen-mode 격리)
     doc.body.classList.add('kitchen-mode');
     // 사이드바 토글 버튼
@@ -2039,7 +2048,6 @@ def render_kitchen_view():
     });
   }
   setTimeout(attach, 80);
-  setTimeout(attach, 400);
 })();
 </script>
 """,
@@ -2082,13 +2090,13 @@ def render_chat_view():
             "dish_name": "카놀리",
             "servings": 2,
             "cooking_time": "30분",
-            "difficulty": "보통",
+            "difficulty": "medium",
             "ingredients": [
-                {"name": "튀긴 페이스트리 셸", "amount": "4개"},
-                {"name": "리코타 치즈", "amount": "200g"},
-                {"name": "설탕", "amount": "3큰술"},
-                {"name": "초콜릿 칩", "amount": "2큰술"},
-                {"name": "바닐라 에센스", "amount": "1작은술"},
+                "튀긴 페이스트리 셸(4개)",
+                "리코타 치즈(200g)",
+                "설탕(3큰술)",
+                "초콜릿 칩(2큰술)",
+                "바닐라 에센스(1작은술)",
             ],
             "steps": [
                 "리코타 치즈를 고운 체에 걸러 물기를 뺀다.",
@@ -2214,6 +2222,48 @@ def render_chat_view():
     # ============================================================
     # DEV MODE END
     # ============================================================
+
+    # ── 저장 레시피 채팅 로드 처리 (1단계: 로딩 화면 트리거) — topbar보다 먼저 ──
+    _pending_recipe = st.session_state.get("load_recipe_pending")
+    if _pending_recipe is not None:
+        st.session_state["load_recipe_pending"] = None
+        st.session_state["_recipe_loading"] = True
+        st.session_state["_recipe_loading_data"] = _pending_recipe
+        st.rerun()
+
+    # ── 저장 레시피 채팅 로드 처리 (2단계: 로딩 화면만 표시 후 데이터 구성) — topbar보다 먼저 ──
+    if st.session_state.get("_recipe_loading"):
+        _loading_data = st.session_state.get("_recipe_loading_data")
+        st.session_state["_recipe_loading"] = False
+        st.session_state["_recipe_loading_data"] = None
+        st.markdown(
+            """<div style="display:flex;flex-direction:column;align-items:center;
+            justify-content:center;height:100vh;gap:16px">
+            <div class="typing"><i></i><i></i><i></i></div>
+            <div style="color:var(--ink-3);font-size:14px;font-weight:500">레시피를 불러오는 중...</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        st.session_state["chat_history"] = []
+        st.session_state["step"] = 4
+        st.session_state["recipe_result"] = _loading_data
+        st.session_state["recipe_confirmed"] = True
+        st.session_state["awaiting_revision"] = False
+        st.session_state["reanalyze_pending"] = False
+        st.session_state["image_bytes"] = None
+        st.session_state["mime_type"] = None
+        st.session_state["vision_result"] = None
+        add_ai_message("📂 저장된 레시피를 불러왔어요.")
+        add_ai_message(build_recipe_card_html(_loading_data))
+        _saved_missing = _loading_data.get("missing_ingredients", [])
+        if _saved_missing:
+            with st.spinner("네이버 쇼핑 검색 중..."):
+                _shop_html = build_shopping_html(_saved_missing)
+            if _shop_html:
+                add_ai_message(_shop_html)
+        st.rerun()
+        return  # 안전 장치: rerun 후 아래 렌더링 차단
+
     # topbar
     st.markdown(
         f"""
@@ -2229,34 +2279,6 @@ def render_chat_view():
     """,
         unsafe_allow_html=True,
     )
-
-    # ── 저장 레시피 채팅 로드 처리 ──
-    _pending_recipe = st.session_state.get("load_recipe_pending")
-    if _pending_recipe is not None:
-        st.session_state["load_recipe_pending"] = None
-        st.session_state["chat_history"] = []
-        st.session_state["step"] = 4
-        st.session_state["recipe_result"] = _pending_recipe
-        st.session_state["recipe_confirmed"] = True
-        st.session_state["awaiting_revision"] = False
-        st.session_state["reanalyze_pending"] = False
-        st.session_state["image_bytes"] = None
-        st.session_state["mime_type"] = None
-        st.session_state["vision_result"] = None
-        add_ai_message("📂 저장된 레시피를 불러왔어요.")
-        add_ai_message(build_recipe_card_html(_pending_recipe))
-        _saved_missing = _pending_recipe.get("missing_ingredients", [])
-        if _saved_missing:
-            _missing_html = (
-                "<b>미구매 재료:</b><br>"
-                + "<br>".join(f"• {html.escape(str(_m))}" for _m in _saved_missing)
-            )
-            add_ai_message(_missing_html)
-            with st.spinner("네이버 쇼핑 검색 중..."):
-                _shop_html = build_shopping_html(_saved_missing)
-            if _shop_html:
-                add_ai_message(_shop_html)
-        st.rerun()
 
     # ── 웰컴 메시지 (최초 1회) ──
     if not st.session_state["chat_history"]:
@@ -2328,7 +2350,7 @@ def render_chat_view():
         else:
             # 파일 선택됨
             image_bytes = uploaded_file.getvalue()
-            mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0]
+            mime_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0] or "image/jpeg"
             _cur_name = uploaded_file.name
 
             # 2단계 A: 새 파일 감지 → typing 표시 후 rerun
@@ -2568,7 +2590,10 @@ def render_chat_view():
             st.rerun()
         elif _revising_now and _chat_val.strip():
             add_user_message(_chat_val)
-            st.session_state["extra_requests"] = _chat_val
+            _prev_extra = (st.session_state.get("extra_requests") or "").strip()
+            st.session_state["extra_requests"] = (
+                f"{_prev_extra}\n{_chat_val.strip()}" if _prev_extra else _chat_val.strip()
+            )
             st.session_state["recipe_result"] = None
             st.session_state["awaiting_revision"] = False
             st.rerun()
